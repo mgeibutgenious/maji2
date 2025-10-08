@@ -1,322 +1,212 @@
-// ===== Model / Labels / Sizes =====
 let model;
 const classLabels = ['Big Lot', 'C Press', 'Snyders'];
 const INPUT_SIZE = 224;
 
 let videoEl = null;
 let running = false;
-
-// Freeze state after capture
 let isFrozen = false;
-let frozenDataURL = null;
 
-// ===== EXACT model math you used =====
-function makeInputFromVideo(video) {
-  return tf.tidy(() => {
-    const tensor = tf.browser.fromPixels(video)
-      .resizeNearestNeighbor([INPUT_SIZE, INPUT_SIZE])
-      .toFloat()
-      .div(tf.scalar(255.0))
-      .expandDims(); // [1,H,W,3]
-    return tensor;
-  });
+let lastTop = null;
+let baseDirHandle = null;
+
+function makeInputFromVideo(video){
+  return tf.tidy(()=> tf.browser.fromPixels(video)
+    .resizeNearestNeighbor([INPUT_SIZE, INPUT_SIZE])
+    .toFloat()
+    .div(tf.scalar(255))
+    .expandDims());
 }
 
-async function loadModel() {
+async function loadModel(){
   model = await tf.loadLayersModel('tfjs_model/model.json');
-  tf.tidy(() => {
+  tf.tidy(()=>{
     const z = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
     const y = model.predict(z);
-    if (Array.isArray(y)) y.forEach(t => t.dispose()); else y.dispose?.();
+    (Array.isArray(y)? y.forEach(t=>t.dispose()): y.dispose?.());
   });
-  console.log("Model loaded");
 }
 
-async function setupCamera() {
+async function setupCamera(){
   const el = document.getElementById('webcam');
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" }, audio: false
-  });
+  const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"environment" }, audio:false });
   el.srcObject = stream;
-  await new Promise(res => (el.onloadedmetadata = () => res()));
+  await new Promise(r=> el.onloadedmetadata = ()=> r());
   await el.play();
   videoEl = el;
   return el;
 }
 
-function setSummary(topLabel, topP) {
-  const summary = document.getElementById('summary');
-  summary.textContent = `${topLabel}（${(topP * 100).toFixed(1)}%）`;
+function setSummary(topLabel, topP){
+  document.getElementById('summary').textContent =
+    `${topLabel}（${(topP*100).toFixed(1)}%）`;
 }
 
-function renderListNoPerc(bestIdx) {
+function renderList(bestIdx){
   const predsEl = document.getElementById('predictions');
-  predsEl.innerHTML = classLabels.map((label, i) => `
-    <div class="row ${i === bestIdx ? 'best' : ''}">
-      <div>${label}</div>
-      <div></div>
+  predsEl.innerHTML = classLabels.map((label,i)=>`
+    <div class="row ${i===bestIdx?'best':''}">
+      <div>${label}</div><div></div>
     </div>
   `).join('');
 }
 
-// ===== Predict Loop =====
-let lastTop = null;
+async function selectBackend(){
+  try{ await tf.setBackend('webgl'); }catch(_){}
+  if(tf.getBackend()!=='webgl'){ try{ await tf.setBackend('wasm'); }catch(_){} }
+  await tf.ready();
+  document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
+}
 
-async function predictLoop() {
-  if (!running) return;
-  if (isFrozen) return; // frozen: keep still
-
+async function predictLoop(){
+  if(!running || isFrozen) return;
   await tf.nextFrame();
-  try {
+  try{
     const input = makeInputFromVideo(videoEl);
-    const prediction = model.predict(input);
-    const predArray = await prediction.data();
-
-    // compute best only once
-    let bestIdx = 0, bestVal = -Infinity;
-    for (let i = 0; i < predArray.length; i++) {
-      if (predArray[i] > bestVal) { bestVal = predArray[i]; bestIdx = i; }
-    }
-    lastTop = { label: classLabels[bestIdx], confidence: predArray[bestIdx] };
-
-    // Show % only in summary (single place)
+    const out = model.predict(input);
+    const probs = await out.data(); // softmax from your model
+    let bestIdx=0, best=probs[0];
+    for(let i=1;i<probs.length;i++) if(probs[i]>best){ best=probs[i]; bestIdx=i; }
+    lastTop = { label: classLabels[bestIdx], confidence: best };
     setSummary(lastTop.label, lastTop.confidence);
-
-    // Labels list (no percentage)
-    renderListNoPerc(bestIdx);
-
-    tf.dispose([input, prediction]);
-  } catch (e) {
-    console.error(e);
-    document.getElementById('err').textContent = String(e?.message || e);
+    renderList(bestIdx);
+    tf.dispose([input,out]);
+  }catch(e){
+    document.getElementById('err').textContent = String(e?.message||e);
   }
   requestAnimationFrame(predictLoop);
 }
 
-// ===== Start & Cleanup =====
-function stopStreamAndFreezePoster(blob) {
-  if (videoEl) {
-    const url = URL.createObjectURL(blob);
-    frozenDataURL = url;
-    // pause and keep last frame visible
-    videoEl.pause();
-    if (videoEl.srcObject) {
-      for (const track of videoEl.srcObject.getVideoTracks()) track.stop();
-      videoEl.srcObject = null;
-    }
-  }
-}
-
-function clearFrozenPoster() {
-  if (frozenDataURL) { URL.revokeObjectURL(frozenDataURL); frozenDataURL = null; }
-}
-
-function stop() {
-  running = false;
-  const s = document.getElementById('status'); if (s) s.textContent = '停止中';
-}
-
-function disposeAll() {
-  stop();
-  if (model) { model.dispose(); model = undefined; }
-  if (videoEl && videoEl.srcObject) {
-    for (const track of videoEl.srcObject.getVideoTracks()) track.stop();
-    videoEl.srcObject = null;
-  }
-  tf.engine().disposeVariables();
-  tf.backend().dispose?.();
-}
-
-// ===== Local saving to real folders (File System Access API) =====
-let baseDirHandle = null;
-
-async function chooseBaseFolder() {
-  if (!window.showDirectoryPicker) {
-    document.getElementById('saveStatus').textContent =
-      'ブラウザがフォルダ保存に未対応です（Chrome/Edge 推奨）。ダウンロード保存に切替えます。';
+/* ===== Save to real folders (File System Access API) ===== */
+async function chooseBaseFolder(){
+  if(!window.showDirectoryPicker){
+    document.getElementById('saveStatus').textContent='ブラウザがフォルダ保存に未対応です（Chrome/Edge 推奨）。';
     return;
   }
   baseDirHandle = await window.showDirectoryPicker();
-  document.getElementById('saveStatus').textContent =
-    '保存先を設定しました。ここに自動保存します。';
+  document.getElementById('saveStatus').textContent='保存先を設定しました。';
 }
-
-async function ensureSubdir(parent, name) {
-  return await parent.getDirectoryHandle(name, { create: true });
-}
-
-function yyyymmdd() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth()+1).padStart(2,'0');
-  const dd = String(d.getDate()).padStart(2,'0');
-  return `${yyyy}${mm}${dd}`;
-}
-
-function captureFrameToBlob() {
-  return new Promise((resolve) => {
-    const canvas = document.getElementById('captureCanvas');
-    const w = videoEl.videoWidth, h = videoEl.videoHeight;
-    canvas.width = w; canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(videoEl, 0, 0, w, h);
-    canvas.toBlob((blob) => resolve(blob), 'image/png', 0.92);
+async function ensureSubdir(parent,name){ return parent.getDirectoryHandle(name,{create:true}); }
+function yyyymmdd(){ const d=new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; }
+function captureFrameToBlob(){
+  return new Promise(res=>{
+    const c = document.getElementById('captureCanvas');
+    const w=videoEl.videoWidth,h=videoEl.videoHeight;
+    c.width=w; c.height=h;
+    const g=c.getContext('2d'); g.drawImage(videoEl,0,0,w,h);
+    c.toBlob(b=>res(b),'image/png',0.92);
   });
 }
-
-async function writeBlobTo(handle, filename, blob) {
-  const fileHandle = await handle.getFileHandle(filename, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(blob);
-  await writable.close();
+async function writeBlobTo(handle,filename,blob){
+  const fh = await handle.getFileHandle(filename,{create:true});
+  const w = await fh.createWritable(); await w.write(blob); await w.close();
 }
-
-function downloadFallback(filename, blob) {
+function downloadFallback(filename,blob){
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  const a = document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 }
-
-async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob) {
-  const date = yyyymmdd();
-  const confPct = (conf * 100).toFixed(0);
-  const filename = `${date}_${baseLabel}_${confPct}%.png`;
-
-  try {
-    if (baseDirHandle) {
+async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob){
+  const filename = `${yyyymmdd()}_${baseLabel}_${(conf*100).toFixed(0)}%.png`;
+  try{
+    if(baseDirHandle){
       const root = await ensureSubdir(baseDirHandle, whereFolder);
-      const classDir = await ensureSubdir(root, folderClass);
-      await writeBlobTo(classDir, filename, blob);
-      document.getElementById('saveStatus').textContent =
-        `保存しました: ${whereFolder}/${folderClass}/${filename}`;
-    } else {
+      const dir  = await ensureSubdir(root, folderClass);
+      await writeBlobTo(dir, filename, blob);
+      document.getElementById('saveStatus').textContent = `保存しました: ${whereFolder}/${folderClass}/${filename}`;
+    }else{
       downloadFallback(`${whereFolder}_${folderClass}_${filename}`, blob);
-      document.getElementById('saveStatus').textContent =
-        `ダウンロードしました: ${whereFolder}/${folderClass}/${filename}`;
+      document.getElementById('saveStatus').textContent = `ダウンロードしました: ${whereFolder}/${folderClass}/${filename}`;
     }
-  } catch (e) {
-    console.error(e);
-    document.getElementById('saveStatus').textContent = `保存エラー: ${e.message || e}`;
-  } finally {
-    // hide choices after save
-    elAgree.style.display = 'none';
-    elDisagree.style.display = 'none';
-    elChooseBig.style.display = 'none';
-    elChooseC.style.display = 'none';
-    elChooseS.style.display = 'none';
+  }catch(e){
+    document.getElementById('saveStatus').textContent = `保存エラー: ${e.message||e}`;
+  }finally{
+    // hide choice buttons after save
+    showAgree(false); showDisagree(false); showChoices(false);
   }
 }
 
-// ===== Capture + Agree/Disagree flow =====
-let capturedBlob = null;
-let cameraJudgment = null;
-let cameraConfidence = null;
+/* ===== Capture flow (freeze) ===== */
+let capturedBlob=null, cameraJudgment=null, cameraConfidence=null;
 
-const elAgree = document.getElementById('agreeBtn');
-const elDisagree = document.getElementById('disagreeBtn');
-const elCap = document.getElementById('captureBtn');
-const elChooseBig = document.getElementById('chooseBigLot');
-const elChooseC = document.getElementById('chooseCPress');
-const elChooseS = document.getElementById('chooseSnyders');
+function showAgree(v){ document.getElementById('agreeBtn').style.display = v?'':'none'; }
+function showDisagree(v){ document.getElementById('disagreeBtn').style.display = v?'':'none'; }
+function showChoices(v){
+  document.getElementById('chooseBigLot').style.display = v?'':'none';
+  document.getElementById('chooseCPress').style.display = v?'':'none';
+  document.getElementById('chooseSnyders').style.display = v?'':'none';
+}
 
-elCap.addEventListener('click', async () => {
-  document.getElementById('saveStatus').textContent = '';
-  if (!videoEl || !lastTop) {
-    document.getElementById('saveStatus').textContent =
-      'まだ予測がありません。少し待ってから再試行してください。';
-    return;
-  }
-
-  // 1) capture current frame
+document.getElementById('captureBtn').addEventListener('click', async ()=>{
+  document.getElementById('saveStatus').textContent='';
+  if(!videoEl || !lastTop){ document.getElementById('saveStatus').textContent='まだ予測がありません。少し待ってください。'; return; }
+  // capture first, then freeze
   capturedBlob = await captureFrameToBlob();
   cameraJudgment = lastTop.label;
   cameraConfidence = lastTop.confidence;
-
-  // 2) freeze: stop loop & pause camera
+  // freeze: stop loop & pause camera
   isFrozen = true;
   running = false;
-  stopStreamAndFreezePoster(capturedBlob);
-  document.getElementById('status').textContent = 'キャプチャ中（停止）';
-
-  // 3) show Agree/Disagree
-  elAgree.style.display = '';
-  elDisagree.style.display = '';
-
-  // hide class choices until Disagree
-  elChooseBig.style.display = 'none';
-  elChooseC.style.display = 'none';
-  elChooseS.style.display = 'none';
+  if(videoEl.srcObject){
+    for(const t of videoEl.srcObject.getVideoTracks()) t.stop();
+    videoEl.srcObject = null;
+  }
+  videoEl.pause();
+  document.getElementById('status').textContent='キャプチャ中（停止）';
+  showAgree(true); showDisagree(true); showChoices(false);
 });
 
-elAgree.addEventListener('click', async () => {
-  if (!capturedBlob) return;
+document.getElementById('agreeBtn').addEventListener('click', async ()=>{
+  if(!capturedBlob) return;
   await saveCaptured('Agree', cameraJudgment, cameraJudgment, cameraConfidence, capturedBlob);
 });
-elDisagree.addEventListener('click', () => {
-  if (!capturedBlob) return;
-  elChooseBig.style.display = '';
-  elChooseC.style.display = '';
-  elChooseS.style.display = '';
+document.getElementById('disagreeBtn').addEventListener('click', ()=>{
+  if(!capturedBlob) return;
+  showChoices(true);
 });
-elChooseBig.addEventListener('click', async () => {
-  if (!capturedBlob) return;
-  await saveCaptured('Disagree', 'Big Lot', cameraJudgment, cameraConfidence, capturedBlob);
+document.getElementById('chooseBigLot').addEventListener('click', async ()=>{
+  if(!capturedBlob) return;
+  await saveCaptured('Disagree','Big Lot',cameraJudgment,cameraConfidence,capturedBlob);
 });
-elChooseC.addEventListener('click', async () => {
-  if (!capturedBlob) return;
-  await saveCaptured('Disagree', 'C Press', cameraJudgment, cameraConfidence, capturedBlob);
+document.getElementById('chooseCPress').addEventListener('click', async ()=>{
+  if(!capturedBlob) return;
+  await saveCaptured('Disagree','C Press',cameraJudgment,cameraConfidence,capturedBlob);
 });
-elChooseS.addEventListener('click', async () => {
-  if (!capturedBlob) return;
-  await saveCaptured('Disagree', 'Snyders', cameraJudgment, cameraConfidence, capturedBlob);
+document.getElementById('chooseSnyders').addEventListener('click', async ()=>{
+  if(!capturedBlob) return;
+  await saveCaptured('Disagree','Snyders',cameraJudgment,cameraConfidence,capturedBlob);
 });
 
-// ===== Buttons & Init =====
+/* ===== Top buttons ===== */
 document.getElementById('chooseFolderBtn').addEventListener('click', chooseBaseFolder);
 
-document.getElementById('startBtn').addEventListener('click', async () => {
-  document.getElementById('err').textContent = '';
-
-  // If we were frozen, unfreeze & reopen camera
-  if (isFrozen) {
-    clearFrozenPoster();
-    isFrozen = false;
-  }
-  if (!videoEl || !videoEl.srcObject) {
+document.getElementById('startBtn').addEventListener('click', async ()=>{
+  document.getElementById('err').textContent='';
+  // unfreeze & reopen camera if needed
+  if(isFrozen){ isFrozen=false; }
+  if(!videoEl || !videoEl.srcObject){
     await setupCamera();
   }
-  if (!model) await loadModel();
-
+  if(!model) await loadModel();
   running = true;
-  const s = document.getElementById('status'); if (s) s.textContent = '推論中…';
+  document.getElementById('status').textContent='推論中…';
   requestAnimationFrame(predictLoop);
 });
 
-async function selectBackend() {
-  try { await tf.setBackend('webgl'); } catch (_) {}
-  if (tf.getBackend() !== 'webgl') {
-    try { await tf.setBackend('wasm'); } catch (_) {}
-  }
-  await tf.ready();
-  const b = document.getElementById('backend');
-  if (b) b.textContent = `backend: ${tf.getBackend()}`;
-}
-
-window.addEventListener('DOMContentLoaded', async () => {
-  try {
+/* ===== Init ===== */
+window.addEventListener('DOMContentLoaded', async ()=>{
+  try{
     await selectBackend();
     await setupCamera();
     await loadModel();
     running = true;
-    const s = document.getElementById('status'); if (s) s.textContent = '推論中…';
+    document.getElementById('status').textContent='推論中…';
     requestAnimationFrame(predictLoop);
-  } catch (e) {
-    console.error(e);
-    document.getElementById('err').textContent = '初期化エラー: ' + (e?.message || e);
+  }catch(e){
+    document.getElementById('err').textContent='初期化エラー: '+(e?.message||e);
   }
 });
 
-window.addEventListener('pagehide', disposeAll);
-window.addEventListener('beforeunload', disposeAll);
+window.addEventListener('pagehide', ()=>{
+  running=false;
+  if(videoEl && videoEl.srcObject){ for(const t of videoEl.srcObject.getVideoTracks()) t.stop(); videoEl.srcObject=null; }
+  tf.engine().disposeVariables(); tf.backend().dispose?.();
+});
