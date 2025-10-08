@@ -38,22 +38,17 @@ async function setupCamera(){
   return el;
 }
 
-/* ===== Rendering ===== */
-function setSummaryAllPerc(probs){
-  // One line: "Big Lot A%, C Press B%, Snyders X%"
-  const parts = classLabels.map((label,i)=> `${label} ${(probs[i]*100).toFixed(1)}%`);
-  document.getElementById('summary').textContent = parts.join(', ');
-}
-
-function renderListNoPerc(bestIdx){
+/* ===== render list with percentages only (top highlighted) ===== */
+function renderListWithPerc(probs, bestIdx){
   const predsEl = document.getElementById('predictions');
   predsEl.innerHTML = classLabels.map((label,i)=>`
     <div class="row ${i===bestIdx?'best':''}">
-      <div>${label}</div><div></div>
+      <div>${label}</div>
+      <div>${(probs[i]*100).toFixed(1)}%</div>
     </div>`).join('');
 }
 
-/* ===== Loop ===== */
+/* ===== loop ===== */
 async function predictLoop(){
   if(!running || isFrozen) return;
   await tf.nextFrame();
@@ -62,14 +57,13 @@ async function predictLoop(){
     const out = model.predict(input);
     const probs = await out.data();
 
-    // Best index
+    // best idx
     let bestIdx=0, best=probs[0];
     for(let i=1;i<probs.length;i++) if(probs[i]>best){ best=probs[i]; bestIdx=i; }
     lastTop = { label: classLabels[bestIdx], confidence: best };
 
-    // Show one-line percentages + green highlight list
-    setSummaryAllPerc(probs);
-    renderListNoPerc(bestIdx);
+    // show list w/ percentages (only place with %)
+    renderListWithPerc(probs, bestIdx);
 
     tf.dispose([input,out]);
   }catch(e){
@@ -78,7 +72,7 @@ async function predictLoop(){
   requestAnimationFrame(predictLoop);
 }
 
-/* ===== Save to local folders ===== */
+/* ===== folder choosing & saving ===== */
 async function chooseBaseFolder(){
   if(!window.showDirectoryPicker){
     document.getElementById('saveStatus').textContent='ブラウザがフォルダ保存に未対応です（Chrome/Edge 推奨）。';
@@ -126,7 +120,7 @@ async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob){
   }
 }
 
-/* ===== Capture flow with visible still ===== */
+/* ===== capture flow with visible still ===== */
 let capturedBlob=null, cameraJudgment=null, cameraConfidence=null;
 
 function showAgree(v){ document.getElementById('agreeBtn').style.display = v?'':'none'; }
@@ -144,19 +138,19 @@ document.getElementById('captureBtn').addEventListener('click', async ()=>{
     return;
   }
 
-  // 1) Grab current frame to blob
+  // 1) capture blob of the current frame
   capturedBlob = await captureFrameToBlob();
   cameraJudgment = lastTop.label;
   cameraConfidence = lastTop.confidence;
 
-  // 2) Show the captured frame as an overlay image (so no black)
+  // 2) display the captured frame overlay so it doesn’t go black
   const url = URL.createObjectURL(capturedBlob);
   freezeImg.src = url;
   freezeImg.style.display = 'block';
 
-  // 3) Stop loop and pause/stop camera
+  // 3) freeze: stop loop & stop camera
   isFrozen = true;
-  running  = false;
+  running = false;
   if(videoEl.srcObject){
     for(const t of videoEl.srcObject.getVideoTracks()) t.stop();
     videoEl.srcObject = null;
@@ -164,7 +158,7 @@ document.getElementById('captureBtn').addEventListener('click', async ()=>{
   videoEl.pause();
   document.getElementById('status').textContent='キャプチャ中（停止）';
 
-  // 4) Show Agree/Disagree
+  // 4) show Agree/Disagree
   showAgree(true); showDisagree(true); showChoices(false);
 });
 
@@ -172,7 +166,6 @@ document.getElementById('agreeBtn').addEventListener('click', async ()=>{
   if(!capturedBlob) return;
   await saveCaptured('Agree', cameraJudgment, cameraJudgment, cameraConfidence, capturedBlob);
 });
-
 document.getElementById('disagreeBtn').addEventListener('click', ()=>{
   if(!capturedBlob) return;
   showChoices(true);
@@ -190,12 +183,12 @@ document.getElementById('chooseSnyders').addEventListener('click', async ()=>{
   await saveCaptured('Disagree','Snyders',cameraJudgment,cameraConfidence,capturedBlob);
 });
 
-/* ===== Top buttons ===== */
+/* ===== top buttons ===== */
 document.getElementById('chooseFolderBtn').addEventListener('click', chooseBaseFolder);
 
 document.getElementById('startBtn').addEventListener('click', async ()=>{
   document.getElementById('err').textContent='';
-  // unfreeze: hide overlay, release object URL
+  // unfreeze & hide overlay
   if(isFrozen){
     isFrozen=false;
     if(freezeImg.src){ URL.revokeObjectURL(freezeImg.src); }
@@ -211,7 +204,7 @@ document.getElementById('startBtn').addEventListener('click', async ()=>{
   requestAnimationFrame(predictLoop);
 });
 
-/* ===== Backend, init, cleanup ===== */
+/* ===== backend/init/cleanup ===== */
 async function selectBackend(){
   try{ await tf.setBackend('webgl'); }catch(_){}
   if(tf.getBackend()!=='webgl'){ try{ await tf.setBackend('wasm'); }catch(_){} }
