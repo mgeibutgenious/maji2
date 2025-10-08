@@ -7,8 +7,8 @@ let videoEl = null;
 let running = false;
 
 // Freeze state after capture
-let isFrozen = false;        // UI/loop freeze flag
-let frozenDataURL = null;    // to show frozen still in <video> poster if needed
+let isFrozen = false;
+let frozenDataURL = null;
 
 // ===== EXACT model math you used =====
 function makeInputFromVideo(video) {
@@ -44,41 +44,19 @@ async function setupCamera() {
   return el;
 }
 
-// ===== UI helpers =====
-function renderBoth(predArray) {
-  // Original block
-  const resultP = document.getElementById('result');
-  let text = '';
-  for (let i = 0; i < classLabels.length; i++) {
-    text += `${classLabels[i]}: ${(predArray[i] * 100).toFixed(2)}%\n`;
-  }
-  resultP.innerText = text.trimEnd();
-
-  // Vertical list with best highlighted
-  const items = classLabels.map((label, i) => ({ label, p: predArray[i] ?? 0 }));
-  let bestIdx = 0, bestVal = -Infinity;
-  for (let i = 0; i < items.length; i++) if (items[i].p > bestVal) { bestVal = items[i].p; bestIdx = i; }
-
-  const predsEl = document.getElementById('predictions');
-  predsEl.innerHTML = items.map((it, i) => `
-    <div class="row ${i === bestIdx ? 'best' : ''}">
-      <div>${it.label}</div>
-      <div>${(it.p * 100).toFixed(1)}%</div>
-    </div>
-  `).join('');
-
-  // store latest top for capture naming
-  lastTop = { label: items[bestIdx].label, confidence: items[bestIdx].p };
+function setSummary(topLabel, topP) {
+  const summary = document.getElementById('summary');
+  summary.textContent = `${topLabel}（${(topP * 100).toFixed(1)}%）`;
 }
 
-async function selectBackend() {
-  try { await tf.setBackend('webgl'); } catch (_) {}
-  if (tf.getBackend() !== 'webgl') {
-    try { await tf.setBackend('wasm'); } catch (_) {}
-  }
-  await tf.ready();
-  const b = document.getElementById('backend');
-  if (b) b.textContent = `backend: ${tf.getBackend()}`;
+function renderListNoPerc(bestIdx) {
+  const predsEl = document.getElementById('predictions');
+  predsEl.innerHTML = classLabels.map((label, i) => `
+    <div class="row ${i === bestIdx ? 'best' : ''}">
+      <div>${label}</div>
+      <div></div>
+    </div>
+  `).join('');
 }
 
 // ===== Predict Loop =====
@@ -86,14 +64,27 @@ let lastTop = null;
 
 async function predictLoop() {
   if (!running) return;
-  if (isFrozen) return; // freeze: do not update percentages
+  if (isFrozen) return; // frozen: keep still
 
   await tf.nextFrame();
   try {
     const input = makeInputFromVideo(videoEl);
     const prediction = model.predict(input);
     const predArray = await prediction.data();
-    renderBoth(predArray);
+
+    // compute best only once
+    let bestIdx = 0, bestVal = -Infinity;
+    for (let i = 0; i < predArray.length; i++) {
+      if (predArray[i] > bestVal) { bestVal = predArray[i]; bestIdx = i; }
+    }
+    lastTop = { label: classLabels[bestIdx], confidence: predArray[bestIdx] };
+
+    // Show % only in summary (single place)
+    setSummary(lastTop.label, lastTop.confidence);
+
+    // Labels list (no percentage)
+    renderListNoPerc(bestIdx);
+
     tf.dispose([input, prediction]);
   } catch (e) {
     console.error(e);
@@ -104,15 +95,11 @@ async function predictLoop() {
 
 // ===== Start & Cleanup =====
 function stopStreamAndFreezePoster(blob) {
-  // Stop tracks, keep a still frame visible
   if (videoEl) {
-    // assign still image to video poster via dataURL
     const url = URL.createObjectURL(blob);
     frozenDataURL = url;
-    // Some browsers show last frame if paused; ensure with poster snapshot using <img> overlay technique:
-    // Simpler: pause and keep video element (last frame visible in most browsers)
+    // pause and keep last frame visible
     videoEl.pause();
-
     if (videoEl.srcObject) {
       for (const track of videoEl.srcObject.getVideoTracks()) track.stop();
       videoEl.srcObject = null;
@@ -121,10 +108,7 @@ function stopStreamAndFreezePoster(blob) {
 }
 
 function clearFrozenPoster() {
-  if (frozenDataURL) {
-    URL.revokeObjectURL(frozenDataURL);
-    frozenDataURL = null;
-  }
+  if (frozenDataURL) { URL.revokeObjectURL(frozenDataURL); frozenDataURL = null; }
 }
 
 function stop() {
@@ -143,7 +127,7 @@ function disposeAll() {
   tf.backend().dispose?.();
 }
 
-// ===== Local saving with real folders (File System Access API) =====
+// ===== Local saving to real folders (File System Access API) =====
 let baseDirHandle = null;
 
 async function chooseBaseFolder() {
@@ -216,7 +200,7 @@ async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob) {
     console.error(e);
     document.getElementById('saveStatus').textContent = `保存エラー: ${e.message || e}`;
   } finally {
-    // hide choice buttons after save
+    // hide choices after save
     elAgree.style.display = 'none';
     elDisagree.style.display = 'none';
     elChooseBig.style.display = 'none';
@@ -250,7 +234,7 @@ elCap.addEventListener('click', async () => {
   cameraJudgment = lastTop.label;
   cameraConfidence = lastTop.confidence;
 
-  // 2) freeze UI: stop loop, pause & release camera so it feels like a photo
+  // 2) freeze: stop loop & pause camera
   isFrozen = true;
   running = false;
   stopStreamAndFreezePoster(capturedBlob);
@@ -258,9 +242,7 @@ elCap.addEventListener('click', async () => {
 
   // 3) show Agree/Disagree
   elAgree.style.display = '';
-  elAgree.textContent = 'Agree';         // ensure text shown
   elDisagree.style.display = '';
-  elDisagree.textContent = 'Disagree';   // ensure text shown
 
   // hide class choices until Disagree
   elChooseBig.style.display = 'none';
@@ -272,14 +254,12 @@ elAgree.addEventListener('click', async () => {
   if (!capturedBlob) return;
   await saveCaptured('Agree', cameraJudgment, cameraJudgment, cameraConfidence, capturedBlob);
 });
-
 elDisagree.addEventListener('click', () => {
   if (!capturedBlob) return;
   elChooseBig.style.display = '';
   elChooseC.style.display = '';
   elChooseS.style.display = '';
 });
-
 elChooseBig.addEventListener('click', async () => {
   if (!capturedBlob) return;
   await saveCaptured('Disagree', 'Big Lot', cameraJudgment, cameraConfidence, capturedBlob);
@@ -299,12 +279,11 @@ document.getElementById('chooseFolderBtn').addEventListener('click', chooseBaseF
 document.getElementById('startBtn').addEventListener('click', async () => {
   document.getElementById('err').textContent = '';
 
-  // if we were frozen after capture, resume: re-open camera
+  // If we were frozen, unfreeze & reopen camera
   if (isFrozen) {
     clearFrozenPoster();
     isFrozen = false;
   }
-
   if (!videoEl || !videoEl.srcObject) {
     await setupCamera();
   }
@@ -314,6 +293,16 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   const s = document.getElementById('status'); if (s) s.textContent = '推論中…';
   requestAnimationFrame(predictLoop);
 });
+
+async function selectBackend() {
+  try { await tf.setBackend('webgl'); } catch (_) {}
+  if (tf.getBackend() !== 'webgl') {
+    try { await tf.setBackend('wasm'); } catch (_) {}
+  }
+  await tf.ready();
+  const b = document.getElementById('backend');
+  if (b) b.textContent = `backend: ${tf.getBackend()}`;
+}
 
 window.addEventListener('DOMContentLoaded', async () => {
   try {
