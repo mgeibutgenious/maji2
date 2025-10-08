@@ -50,13 +50,15 @@
 
     <div class="controls">
       <button id="startBtn">開始</button>
-      <button id="stopBtn">停止</button>
-      <button id="chooseFolderBtn">📁 Choose Save Folder</button>
+      <button id="chooseFolderBtn">保存ファイル</button>
+      <!-- capture placed AFTER 保存ファイル -->
       <button id="captureBtn" title="Capture current frame for labeling">📸 キャプチャ</button>
 
+      <!-- shows only after capture -->
       <button id="agreeBtn" class="btn-green" style="display:none">Agree</button>
       <button id="disagreeBtn" class="btn-red"   style="display:none">Disagree</button>
 
+      <!-- shows only after Disagree -->
       <button id="chooseBigLot"  style="display:none">Big Lot</button>
       <button id="chooseCPress"  style="display:none">C Press</button>
       <button id="chooseSnyders" style="display:none">Snyders</button>
