@@ -3,6 +3,7 @@ const classLabels = ['Big Lot', 'C Press', 'Snyders'];
 const INPUT_SIZE = 224;
 
 let videoEl = null;
+let freezeImg = null;
 let running = false;
 let isFrozen = false;
 
@@ -33,42 +34,43 @@ async function setupCamera(){
   await new Promise(r=> el.onloadedmetadata = ()=> r());
   await el.play();
   videoEl = el;
+  freezeImg = document.getElementById('freezeOverlay');
   return el;
 }
 
-function setSummary(topLabel, topP){
-  document.getElementById('summary').textContent =
-    `${topLabel}（${(topP*100).toFixed(1)}%）`;
+/* ===== Rendering ===== */
+function setSummaryAllPerc(probs){
+  // One line: "Big Lot A%, C Press B%, Snyders X%"
+  const parts = classLabels.map((label,i)=> `${label} ${(probs[i]*100).toFixed(1)}%`);
+  document.getElementById('summary').textContent = parts.join(', ');
 }
 
-function renderList(bestIdx){
+function renderListNoPerc(bestIdx){
   const predsEl = document.getElementById('predictions');
   predsEl.innerHTML = classLabels.map((label,i)=>`
     <div class="row ${i===bestIdx?'best':''}">
       <div>${label}</div><div></div>
-    </div>
-  `).join('');
+    </div>`).join('');
 }
 
-async function selectBackend(){
-  try{ await tf.setBackend('webgl'); }catch(_){}
-  if(tf.getBackend()!=='webgl'){ try{ await tf.setBackend('wasm'); }catch(_){} }
-  await tf.ready();
-  document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
-}
-
+/* ===== Loop ===== */
 async function predictLoop(){
   if(!running || isFrozen) return;
   await tf.nextFrame();
   try{
     const input = makeInputFromVideo(videoEl);
     const out = model.predict(input);
-    const probs = await out.data(); // softmax from your model
+    const probs = await out.data();
+
+    // Best index
     let bestIdx=0, best=probs[0];
     for(let i=1;i<probs.length;i++) if(probs[i]>best){ best=probs[i]; bestIdx=i; }
     lastTop = { label: classLabels[bestIdx], confidence: best };
-    setSummary(lastTop.label, lastTop.confidence);
-    renderList(bestIdx);
+
+    // Show one-line percentages + green highlight list
+    setSummaryAllPerc(probs);
+    renderListNoPerc(bestIdx);
+
     tf.dispose([input,out]);
   }catch(e){
     document.getElementById('err').textContent = String(e?.message||e);
@@ -76,7 +78,7 @@ async function predictLoop(){
   requestAnimationFrame(predictLoop);
 }
 
-/* ===== Save to real folders (File System Access API) ===== */
+/* ===== Save to local folders ===== */
 async function chooseBaseFolder(){
   if(!window.showDirectoryPicker){
     document.getElementById('saveStatus').textContent='ブラウザがフォルダ保存に未対応です（Chrome/Edge 推奨）。';
@@ -87,6 +89,7 @@ async function chooseBaseFolder(){
 }
 async function ensureSubdir(parent,name){ return parent.getDirectoryHandle(name,{create:true}); }
 function yyyymmdd(){ const d=new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; }
+
 function captureFrameToBlob(){
   return new Promise(res=>{
     const c = document.getElementById('captureCanvas');
@@ -96,11 +99,11 @@ function captureFrameToBlob(){
     c.toBlob(b=>res(b),'image/png',0.92);
   });
 }
-async function writeBlobTo(handle,filename,blob){
+async function writeBlobTo(handle, filename, blob){
   const fh = await handle.getFileHandle(filename,{create:true});
   const w = await fh.createWritable(); await w.write(blob); await w.close();
 }
-function downloadFallback(filename,blob){
+function downloadFallback(filename, blob){
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 }
@@ -119,12 +122,11 @@ async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob){
   }catch(e){
     document.getElementById('saveStatus').textContent = `保存エラー: ${e.message||e}`;
   }finally{
-    // hide choice buttons after save
     showAgree(false); showDisagree(false); showChoices(false);
   }
 }
 
-/* ===== Capture flow (freeze) ===== */
+/* ===== Capture flow with visible still ===== */
 let capturedBlob=null, cameraJudgment=null, cameraConfidence=null;
 
 function showAgree(v){ document.getElementById('agreeBtn').style.display = v?'':'none'; }
@@ -137,20 +139,32 @@ function showChoices(v){
 
 document.getElementById('captureBtn').addEventListener('click', async ()=>{
   document.getElementById('saveStatus').textContent='';
-  if(!videoEl || !lastTop){ document.getElementById('saveStatus').textContent='まだ予測がありません。少し待ってください。'; return; }
-  // capture first, then freeze
+  if(!videoEl || !lastTop){
+    document.getElementById('saveStatus').textContent='まだ予測がありません。少し待ってください。';
+    return;
+  }
+
+  // 1) Grab current frame to blob
   capturedBlob = await captureFrameToBlob();
   cameraJudgment = lastTop.label;
   cameraConfidence = lastTop.confidence;
-  // freeze: stop loop & pause camera
+
+  // 2) Show the captured frame as an overlay image (so no black)
+  const url = URL.createObjectURL(capturedBlob);
+  freezeImg.src = url;
+  freezeImg.style.display = 'block';
+
+  // 3) Stop loop and pause/stop camera
   isFrozen = true;
-  running = false;
+  running  = false;
   if(videoEl.srcObject){
     for(const t of videoEl.srcObject.getVideoTracks()) t.stop();
     videoEl.srcObject = null;
   }
   videoEl.pause();
   document.getElementById('status').textContent='キャプチャ中（停止）';
+
+  // 4) Show Agree/Disagree
   showAgree(true); showDisagree(true); showChoices(false);
 });
 
@@ -158,6 +172,7 @@ document.getElementById('agreeBtn').addEventListener('click', async ()=>{
   if(!capturedBlob) return;
   await saveCaptured('Agree', cameraJudgment, cameraJudgment, cameraConfidence, capturedBlob);
 });
+
 document.getElementById('disagreeBtn').addEventListener('click', ()=>{
   if(!capturedBlob) return;
   showChoices(true);
@@ -180,8 +195,13 @@ document.getElementById('chooseFolderBtn').addEventListener('click', chooseBaseF
 
 document.getElementById('startBtn').addEventListener('click', async ()=>{
   document.getElementById('err').textContent='';
-  // unfreeze & reopen camera if needed
-  if(isFrozen){ isFrozen=false; }
+  // unfreeze: hide overlay, release object URL
+  if(isFrozen){
+    isFrozen=false;
+    if(freezeImg.src){ URL.revokeObjectURL(freezeImg.src); }
+    freezeImg.removeAttribute('src');
+    freezeImg.style.display='none';
+  }
   if(!videoEl || !videoEl.srcObject){
     await setupCamera();
   }
@@ -191,7 +211,14 @@ document.getElementById('startBtn').addEventListener('click', async ()=>{
   requestAnimationFrame(predictLoop);
 });
 
-/* ===== Init ===== */
+/* ===== Backend, init, cleanup ===== */
+async function selectBackend(){
+  try{ await tf.setBackend('webgl'); }catch(_){}
+  if(tf.getBackend()!=='webgl'){ try{ await tf.setBackend('wasm'); }catch(_){} }
+  await tf.ready();
+  document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
+}
+
 window.addEventListener('DOMContentLoaded', async ()=>{
   try{
     await selectBackend();
