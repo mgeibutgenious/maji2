@@ -6,6 +6,10 @@ const INPUT_SIZE = 224;
 let videoEl = null;
 let running = false;
 
+// Freeze state after capture
+let isFrozen = false;        // UI/loop freeze flag
+let frozenDataURL = null;    // to show frozen still in <video> poster if needed
+
 // ===== EXACT model math you used =====
 function makeInputFromVideo(video) {
   return tf.tidy(() => {
@@ -82,6 +86,8 @@ let lastTop = null;
 
 async function predictLoop() {
   if (!running) return;
+  if (isFrozen) return; // freeze: do not update percentages
+
   await tf.nextFrame();
   try {
     const input = makeInputFromVideo(videoEl);
@@ -96,7 +102,31 @@ async function predictLoop() {
   requestAnimationFrame(predictLoop);
 }
 
-// ===== Start/Stop & Cleanup =====
+// ===== Start & Cleanup =====
+function stopStreamAndFreezePoster(blob) {
+  // Stop tracks, keep a still frame visible
+  if (videoEl) {
+    // assign still image to video poster via dataURL
+    const url = URL.createObjectURL(blob);
+    frozenDataURL = url;
+    // Some browsers show last frame if paused; ensure with poster snapshot using <img> overlay technique:
+    // Simpler: pause and keep video element (last frame visible in most browsers)
+    videoEl.pause();
+
+    if (videoEl.srcObject) {
+      for (const track of videoEl.srcObject.getVideoTracks()) track.stop();
+      videoEl.srcObject = null;
+    }
+  }
+}
+
+function clearFrozenPoster() {
+  if (frozenDataURL) {
+    URL.revokeObjectURL(frozenDataURL);
+    frozenDataURL = null;
+  }
+}
+
 function stop() {
   running = false;
   const s = document.getElementById('status'); if (s) s.textContent = '停止中';
@@ -114,18 +144,17 @@ function disposeAll() {
 }
 
 // ===== Local saving with real folders (File System Access API) =====
-// User picks a base directory once; we create subfolders and write files there.
 let baseDirHandle = null;
 
 async function chooseBaseFolder() {
   if (!window.showDirectoryPicker) {
     document.getElementById('saveStatus').textContent =
-      'Your browser does not support folder access. Falling back to downloads.';
+      'ブラウザがフォルダ保存に未対応です（Chrome/Edge 推奨）。ダウンロード保存に切替えます。';
     return;
   }
   baseDirHandle = await window.showDirectoryPicker();
   document.getElementById('saveStatus').textContent =
-    'Save folder selected. Files will be written there.';
+    '保存先を設定しました。ここに自動保存します。';
 }
 
 async function ensureSubdir(parent, name) {
@@ -166,7 +195,6 @@ function downloadFallback(filename, blob) {
   URL.revokeObjectURL(url);
 }
 
-// Shared save routine
 async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob) {
   const date = yyyymmdd();
   const confPct = (conf * 100).toFixed(0);
@@ -174,21 +202,19 @@ async function saveCaptured(whereFolder, folderClass, baseLabel, conf, blob) {
 
   try {
     if (baseDirHandle) {
-      // Create folder structure: Agree/Snyders or Disagree/Big Lot
       const root = await ensureSubdir(baseDirHandle, whereFolder);
       const classDir = await ensureSubdir(root, folderClass);
       await writeBlobTo(classDir, filename, blob);
       document.getElementById('saveStatus').textContent =
-        `Saved: ${whereFolder}/${folderClass}/${filename}`;
+        `保存しました: ${whereFolder}/${folderClass}/${filename}`;
     } else {
-      // Fallback to simple download
       downloadFallback(`${whereFolder}_${folderClass}_${filename}`, blob);
       document.getElementById('saveStatus').textContent =
-        `Saved (download): ${whereFolder}/${folderClass}/${filename}`;
+        `ダウンロードしました: ${whereFolder}/${folderClass}/${filename}`;
     }
   } catch (e) {
     console.error(e);
-    document.getElementById('saveStatus').textContent = `Save error: ${e.message || e}`;
+    document.getElementById('saveStatus').textContent = `保存エラー: ${e.message || e}`;
   } finally {
     // hide choice buttons after save
     elAgree.style.display = 'none';
@@ -218,12 +244,25 @@ elCap.addEventListener('click', async () => {
       'まだ予測がありません。少し待ってから再試行してください。';
     return;
   }
+
+  // 1) capture current frame
   capturedBlob = await captureFrameToBlob();
   cameraJudgment = lastTop.label;
   cameraConfidence = lastTop.confidence;
 
+  // 2) freeze UI: stop loop, pause & release camera so it feels like a photo
+  isFrozen = true;
+  running = false;
+  stopStreamAndFreezePoster(capturedBlob);
+  document.getElementById('status').textContent = 'キャプチャ中（停止）';
+
+  // 3) show Agree/Disagree
   elAgree.style.display = '';
+  elAgree.textContent = 'Agree';         // ensure text shown
   elDisagree.style.display = '';
+  elDisagree.textContent = 'Disagree';   // ensure text shown
+
+  // hide class choices until Disagree
   elChooseBig.style.display = 'none';
   elChooseC.style.display = 'none';
   elChooseS.style.display = 'none';
@@ -241,7 +280,6 @@ elDisagree.addEventListener('click', () => {
   elChooseS.style.display = '';
 });
 
-// Disagree: user picks the correct class, but filename keeps camera’s judgment
 elChooseBig.addEventListener('click', async () => {
   if (!capturedBlob) return;
   await saveCaptured('Disagree', 'Big Lot', cameraJudgment, cameraConfidence, capturedBlob);
@@ -257,15 +295,25 @@ elChooseS.addEventListener('click', async () => {
 
 // ===== Buttons & Init =====
 document.getElementById('chooseFolderBtn').addEventListener('click', chooseBaseFolder);
+
 document.getElementById('startBtn').addEventListener('click', async () => {
   document.getElementById('err').textContent = '';
-  if (!videoEl) await setupCamera();
+
+  // if we were frozen after capture, resume: re-open camera
+  if (isFrozen) {
+    clearFrozenPoster();
+    isFrozen = false;
+  }
+
+  if (!videoEl || !videoEl.srcObject) {
+    await setupCamera();
+  }
   if (!model) await loadModel();
+
   running = true;
   const s = document.getElementById('status'); if (s) s.textContent = '推論中…';
   requestAnimationFrame(predictLoop);
 });
-document.getElementById('stopBtn').addEventListener('click', () => stop());
 
 window.addEventListener('DOMContentLoaded', async () => {
   try {
