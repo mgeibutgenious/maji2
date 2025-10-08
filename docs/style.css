@@ -1,0 +1,24 @@
+body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    margin: 0;
+    padding: 20px;
+    background-color: #f5f5f5;
+}
+
+video {
+    border: 2px solid #444;
+    border-radius: 10px;
+    width: 300px;
+    height: auto;
+}
+
+canvas {
+    display: none;
+}
+
+#result {
+    font-size: 20px;
+    margin-top: 10px;
+    color: #333;
+}
